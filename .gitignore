@@ -1,0 +1,58 @@
+# ============================================================
+# LUT-MoE .gitignore
+# 排除权重、offload 文件、大文件、临时产物
+# ============================================================
+
+# ---- Python 临时文件 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---- 构建产物 ----
+build/
+csrc/build/
+csrc/build_v*/
+csrc/build_new/
+dist/
+*.so
+*.o
+
+# ---- Claude 会话记录（敏感，勿公开）----
+claude_memory*/
+.claude/
+
+# ---- Windows/WSL 垃圾标记文件 ----
+*Zone.Identifier
+
+# ---- 模型权重 / checkpoint / 张量 ----
+*.safetensors
+*.bin
+*.ckpt
+*.pth
+*.pt
+*.onnx
+
+# ---- offload 权重文件（可达数十 GB）----
+offload/*/*
+!offload/*/.gitkeep
+
+# ---- 比赛/竞赛数据 ----
+-home-hh-competition/
+
+# ---- 评测数据集 & 结果产物 ----
+evaluation/dataset/
+evaluation/results/
+*.npz
+
+# ---- 量化码本 token（旧规则）----
+*.tok
+
+# ---- 编辑器 / 系统文件 ----
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

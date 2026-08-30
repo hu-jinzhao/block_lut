@@ -1,0 +1,13 @@
+{
+  "quant_method": "gptq",
+  "bits": 4,
+  "group_size": 128,
+  "desc_act": false,
+  "sym": true,
+  "damp_percent": 0.01,
+  "use_exllama": false,
+  "use_marlin": false,
+  "use_triton": false,
+  "use_cuda_fp16": false,
+  "lm_head": false
+}

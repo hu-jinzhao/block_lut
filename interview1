@@ -1,0 +1,342 @@
+项目介绍：1.LUT 量化算法与推理引擎的适配优化 2026.03 - 2026.07
+研究新型 MoE 模型量化策略与 I/O 调度机制，同时针对 VLLM 和 llama.cpp 推理引擎进行适配优化
+方案与效果：
+• 针对专家矩阵数值特征，提出 blockwise 的聚类查表量化方法，实现了 4bit 近无损量化。同时基于专
+家访问长尾分布的特点，在量化策略的基础上使用冷热异构加渐进式加载的策略，减少 I/O 传输。
+• 将提出的 LUT 量化方法融合到 vLLM 和 llama.cpp 推理框架中。将策略中的查找、 absmax 缩放与矩
+阵乘融合为单次 kernel 调用，实现 0.127ms/GEMV（较未融合版本 13 倍加速）。 llama.cpp 侧还针对渐
+进式加载策略设计 GPU 缓存池管理与 SSD 按需加载，实现动态升降级。
+• 在 4bit 下，所提出的量化策略的困惑度较 BF16 基线仅下降 0.9%（WikiText-2 数据集 8k 上下文），
+TPOT 相对于基线实现 3.36 倍速度提升，渐进式加载策略对 I/O 调度层加速 1.8 倍。
+
+==========================================================================
+面试提问与回答（以口语口吻阐述，像面试现场一样流畅陈述）
+==========================================================================
+
+第一层：基础地基（必考八股，用来热场）
+
+Q1: GPTQ与AWQ的核心区别 + Blockwise聚类查表更接近VQ还是PQ？
+
+答：
+GPTQ的核心思想，简单说就是——基于OBQ的逐层最小二乘误差补偿，它对量化产生的误差做Hessian感知的补偿，把误差传播到后面还没量化的权重里。AWQ的核心思想呢，是基于激活值感知的权重保护——它发现权重里只有1%的salient channel对精度影响巨大，所以保护这些channel不量化或者给更大scale。
+
+追问到我的Blockwise聚类查表。GPTQ和AWQ本质上都是线性伪量化，就是把浮点数线性映射到一个均匀网格上。但我的方法是通过K-means聚类去学习一个非均匀的码本。
+
+在数学本质上它更接近VQ（Vector Quantization），但只针对1维向量。因为我是对单个元素进行聚类分配，每个元素独立映射到最近的聚类中心，本质上就是对标量的VQ。Product Quantization（PQ）是把向量空间拆成若干子空间的乘积再做量化，我这里没有拆分子空间。不过BlockLUT其实有一点PQ的影子——它在Block维度上算absmax归一化，相当于是对每个块做了独立的尺度变换，但这和PQ的分段量化还是两码事。结论：数学本质上是标量的VQ。
+
+
+Q2: 4bit量化的理论极限——为什么只能到3.5~3.8倍？
+
+答：
+FP16是16bit，INT4是4bit，理论压缩比4倍——这是纯数据部分的比值。但工程实现里还有额外开销：
+
+第一是码本存储。LUT有256个centroid，每个是bf16（2字节），码本就是512字节。这对大批量数据来说可以忽略，但如果权重矩阵比较小（比如DeepSeek-V2-Lite的gate_proj是1408x2048），码本开销大概占0.018%，确实可以忽略。但NestedLUT有3套码本（256+256+256），开销翻了三倍。
+
+第二是absmax缩放系数的开销。BlockLUT每128个元素存一个bf16的absmax值，每个元素额外多了1/128x16=0.125bit。外加位平面打包的padding损失——把8bit拆成4+2+2三层存，每层打包对齐也有开销。
+
+第三是页对齐padding。offload文件按OS_PAGE_SIZE对齐写入，每个tensor末尾补零对齐，也是纯开销。
+
+所以实际压缩比在3.5~3.8倍之间。BlockLUT（block=128）实测压缩比约3.7倍。
+
+
+Q3: MoE架构的I/O Bound问题——用算术强度公式解释
+
+答：
+算术强度（Arithmetic Intensity）= FLOPs / Bytes，表示每从内存读一个Byte能做多少次计算。AI低的时候就是I/O Bound。
+
+Dense模型的FFN层：计算量2xd_modelxd_ff，参数量d_modelxd_ff，所以AI ≈ 1 FLOP/Byte（bf16下）。
+
+但MoE的问题是每个token只激活K个专家，但显存里要装下所有专家。放不下就要做CPU-GPU或SSD-GPU换入换出。SSD带宽（~3GB/s）比GPU显存带宽（~2TB/s）慢三个数量级。即使用了压缩，AI也直接崩到接近0。
+
+Dense模型的I/O Bound是"计算vs显存带宽"之争，MoE又多了一层"计算vs SSD带宽"之争。MoE推理优化的核心就是把这层SSD I/O藏起来——通过预取、缓存、压缩。LUT量化把每个权重从16bit压到4~8bit，同样带宽下能传2~4倍数据，变相提高了I/O层的有效带宽。
+
+
+Q4: 路由机制——Top-K routing？K=？负载不均衡怎么办？
+
+答：
+对，用的是Top-K routing。DeepSeek-V2-Lite配置下K=6，总共64个路由专家+2个共享专家。Qwen2-MoE是K=4，60个专家。Switch Transformer是Top-1 routing。
+
+负载不均衡会不会让量化策略崩溃？不会。LUT量化的核心是数据无关的，基于权重的数值分布聚类，token怎么分不影响量化精度。但缓存策略是访问频次驱动的——hot expert升到8bit放GPU显存，cold expert降到4bit扔SSD。路由越不均衡，冷热两极分化越明显，缓存策略反而玩得更溜。
+
+唯一风险是某层所有token都去了同一个专家，浪费了MoE的容量优势。但这是路由训练的问题，不是量化的问题。模型训练时通过辅助负载均衡loss（load_balancing_loss）来约束，DeepSeek modeling里是有这个loss计算的。
+
+
+Q5: vLLM与llama.cpp的差异——为什么要同时适配两个框架？
+
+答：
+vLLM和llama.cpp是两个完全不同的生态位。vLLM主打高吞吐在线服务，PagedAttention消除KV Cache碎片化、Continuous Batching提GPU利用率，跑在数据中心A100/H100上。llama.cpp主打单机/边缘部署，CPU+GPU混合异构，GGUF格式，可以在笔记本上跑。
+
+LUT-MoE的定位是通用的MoE推理加速层，不是只针对某一个框架。vLLM场景下量化压缩降低显存占用，让更大batch size或更长context成为可能，瓶颈是GPU算力和显存带宽。llama.cpp场景下渐进式加载可以把SSD当内存用，实现"显存不够SSD来凑"，瓶颈是PCIe/SSD带宽。
+
+两个框架代表两个典型的部署场景。实现细节不同：vLLM侧做了融合LUT-GEMV kernel（0.127ms/GEMV，13倍加速），llama.cpp侧设计了GPU缓存池管理和SSD按需加载，动态升降级。
+
+
+==========================================================================
+第二层：中层架构与算法（深挖你的设计决策）
+
+Q6: 为什么选"聚类"而不是"线性分桶"？
+
+答：
+AWQ和GPTQ都是线性映射。为什么我做聚类？因为我观察了专家权重的数值分布。
+
+DeepSeek-V2-Lite的专家权重中，gate_proj和up_proj的分布近似正态分布、中心在0附近，但有长尾离群值。down_proj的分布更集中在0附近。最关键的是——这些分布是**多峰的（multimodal）**，存在多个"簇"。等间距线性网格去量化，在密度高的区域分辨率浪费，密度低的区域分辨率不足。
+
+K-means聚类做码本学习，本质上是"在数据密度高的地方分配更多量化Level，密度低的地方分配更少Level"。线性分桶是拿尺子等距划线，聚类是"哪儿人多在哪儿设站点"。
+
+PSNR验证了：同样4bit下，聚类查表比RTN均匀量化PSNR高约5-8dB，验证了聚类对MoE权重分布的适配性。
+
+
+Q7: Blockwise的"Block"尺寸如何确定？
+
+答：
+Block是按元素维度划分的——权重矩阵展平成一维，每128个连续元素一个Block。不是按行也不是按列。
+
+Block尺寸的核心权衡：太小→码本+absmax存储开销剧增，压缩比下降；太大→块内数值分布散，absmax归一化后很多值被压到小区间，聚类失效。
+
+实验候选值：32、64、128、256、512。最终锁定的最佳点是Block=128。原因是：
+- 小于128时，压缩比掉到3.2x以下
+- 大于256时，块内方差太大，归一化后的值集中在[-0.3, 0.3]，码本利用率下降
+- 128刚好平衡压缩比（3.7x）和量化精度（PPL损失仅0.9%）
+- 工程优势：是WARP_SIZE（32）的整数倍，在CUDA kernel里">>7"就是一条指令算block_id，每线程8元素对齐64字节cache line
+
+
+Q8: 码本存储在哪里？
+
+答：
+码本存在Shared Memory里。CUDA kernel——cuda_blocklut_recover_to_bf16——一进kernel就加载：
+
+__shared__ uint16_t lut_smem[256];
+for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+    lut_smem[i] = lut[i];
+}
+__syncthreads();
+
+每个thread block把256个uint16的码本从Global Memory加载到Shared Memory，然后在Shared Memory里查表。查询延迟从几百cycle降到几个cycle。
+
+这会不会成瓶颈？不会，因为开销被分摊了。每个kernel只加载一次码本（512字节），然后每个block处理4096个元素，加载分摊到每个元素不到0.125字节的Global Memory读取。
+
+融合LUT-GEMV kernel里码本甚至加载为float存在Shared Memory（256x4=1KB），因为fused kernel里做乘加需要float精度累加。
+
+
+Q9: 冷热边界的统计周期？
+
+答：
+冷热分层基于累计访问次数，不是固定时间窗口。在LUT_MoECacheHandle::UpdateOnHit()中：
+
+- Tier 2（冷/4bit）：visit_count < 10，mapped16码本（16个centroid）
+- Tier 1（温/6bit）：visit_count >= 10，mapped64码本（64个centroid）
+- Tier 0（热/8bit）：visit_count >= 50，full256码本
+
+周期是动态的——访问越频繁，每次hit累加count，到阈值自动升级。每次专家被调用，StartExec里会node->visit_count += 1。
+
+还有一个num_layers x num_experts的global_access_counts矩阵，在ProactiveDecision()中做缓存分配的相对排序——看自己的count在同行专家中排第几，决定放GPU cache、SM cache还是evict。
+
+冷降级的逻辑：专家被GPU cache逐出时做渐进降级——Tier 0→Tier 1（8→6bit），Tier 1→Tier 2（6→4bit），下次加载只需要读更少的I/O数据。
+
+
+Q10: 渐进式加载的粒度？显存碎片化怎么处理？
+
+答：
+粒度核心单位是专家内单个线性层。每个专家有3个tensor（gate_proj、up_proj、down_proj），换入换出以tensor为基本单位。
+
+在ToWorkers()里，每个专家节点注册一个MemoryDock，dock里有：
+- GPU tensor pool（解压后的bf16权重，放cache slot里）
+- IO pinned pool（SSD→CPU传输的压缩索引数据）
+- EXP pinned pool（解压操作的目标缓冲区）
+
+三个都是预分配的连续内存池，slot大小一致，不存在动态malloc/free导致的碎片。
+
+显存碎片化的处理方式：GPU cache是预先cudaMalloc一大块连续显存，均匀切成固定大小的slot。换入换出只是slot的指针映射，不涉及显存分配释放。代码里：
+
+gpu_pool->pop_free_slot();      // 取一个空闲slot
+gpu_pool->evict(target_slot);   // 清空slot内容
+gpu_pool->place(node, slot);    // 映射节点到slot
+
+全是O(1)操作，没有显存分配，没有碎片化。
+
+
+==========================================================================
+第三层：深层极限性能与硬件博弈（高压区）
+
+Q11: 融合Kernel中的异步流水线——双缓冲？
+
+答：
+看融合LUT-GEMV kernel的实现，一个thread block处理一行，每个thread遍历列元素。码本在Shared Memory里，但确实没有显式的双缓冲流水线。
+
+为什么不需要？因为瓶颈不在码本加载。码本256个float（1KB），一次加载完。每个线程要遍历K≈2048列，做查表、乘absmax、乘input、累加。计算量远大于码本搬入的开销。
+
+kernel内部的异步体现在warp级归约上——不同warp的乘累加计算是并行的，然后通过两级shfl_xor归约合并结果。第一级warp内归约，第二级跨warp共享内存归约。计算和归约是流水线化的。
+
+真正的异步流水线在任务调度层。LUT_MoESchedulerFunc中，Type I任务（需要SM I/O的）和Type II任务（已有SM缓存的）交错调度——当计算瓶颈大于I/O瓶颈时插入Type II任务避免I/O停顿。这是任务级的双缓冲：一个专家在GPU计算时，下一个专家的I/O已经在跑了。
+
+
+Q12: 处理"码本未命中"——预测性预取？
+
+答：
+两个问题拆开说。
+
+第一，码本未命中。码本是全局的——256个centroid对所有专家共享，不是按专家存储的。码本在TensorEngine初始化时通过SetLUTTable()加载到GPU device memory，每个kernel启动时copy到shared memory。所以码本总是在GPU上的。
+
+你说的"未命中"实际是专家权重不在GPU cache里。这时候从SSD加载，如果延迟高，GPU执行流会不会被stall？我们的设计是异步调度——ExpertDispatcher通过EnqueueExpert把任务放队列，OperationSchedule做I/O和计算的调度，然后立即返回。GPU在等数据时，调度器派其他已就绪的专家去GPU执行，实现了计算和I/O的overlap。
+
+第二，预测性预取。确实做了！ExpertPredictor维护每个层的频率表和一个deque窗口历史。预测公式：0.8x全局频率 + 0.2x最近5次激活频率。每层forward结束后，预测下一层最可能激活的top-k个专家，通过SubmitPrefetch()发起预取——以PREFETCH状态进入缓存调度系统，提前从SSD加载到固定内存或GPU cache。
+
+预取有优先级管理，LUT_MoETaskPool里用多级priority queue，高优先级预取任务抢在普通任务之前执行。
+
+
+Q13: 精度评估的"陷阱"——MMLU/HellaSwag掉点？
+
+答：
+说得完全对，Perplexity对离群值不敏感。PPL只反映next token prediction的平均不确定性。
+
+目前项目的精度评估主要基于PPL——WikiText-2下4bit NestedLUT比BF16基线PPL涨0.9%。这是因为项目还在推理性能验证阶段，大规模zero-shot评测（MMLU、HellaSwag、GSM8K）还没作为完整pipeline跑完。
+
+但在evaluation/下有相关探索：phase_c_kl.py做KL散度对比，debug_kl_divergence.py逐层度量量化对hidden state分布的影响。观察到KL散度在量化后确有增加，尤其是前几层。eval_4bit_output_variance.py分析了量化前后的输出方差。
+
+关于Expert-Balancing-Loss：这个Loss是原始模型训练时自带的。推理框架里不涉及微调，没有用calibration set做二次训练。GPTQ那种需要calibration dataset的post-training quantization，在我们这里是用不上的——我们是完全无训练的量化，基于权重的静态数值分布直接聚类，不需要任何data。这是一个trade-off：没有calibration set依赖，但也就没法做activation-aware的精度补偿。不过BlockLUT的块级absmax归一化已经可以捕捉到一些activation相关的动态范围了。
+
+
+Q14: vLLM的CUDA Graph捕获——动态分支怎么规避？
+
+答：
+这确实是尖端的工程问题。vLLM用CUDA Graph消除kernel launch开销，但CUDA Graph要求执行流在capture期间固定、没有动态分支——一旦capture，每次replay都是相同的kernel launch序列。
+
+渐进式加载的最大问题就在这里：专家选取是动态的——这次decode走expert 3、7、15，下次走1、8、22。每个专家可能在GPU cache里（直接算），也可能不在（要触发I/O加载）。每个decode step的kernel launch序列是动态的，CUDA Graph没法capture。
+
+我的规避策略是分层处理。在vLLM集成（quant_method.py）里：
+- Prefill阶段（batch大）：批处理解压+matmul——把所有需要的专家权重解压到bf16，调标准FusedMoE kernel。这个场景控制流确定，CUDA Graph可以capture。
+- Decode阶段（batch=1）：用融合LUT-GEMV kernel。但即便这个kernel，vLLM框架下也没有用到CUDA Graph——因为MoE的专家路由本身就是动态的，vLLM本身对MoE层也没做CUDA Graph capture。
+
+真实情况是：vLLM对MoE层的CUDA Graph支持本身就有局限，不是LUT引入的新问题。attention部分（MHA/MLA）可以用CUDA Graph加速。未来要支持的话，可能的方案是预编译多个Graph变体对应不同专家组合，或者把推理拆成多个子Graph分段replay。
+
+
+Q15: 自研芯片假设——PCIe带宽腰斩、CPU翻倍，怎么调整？
+
+答：
+方案一：从GPU端Offload到CPU端做调度。CPU核心翻倍、PCIe带宽减半，瓶颈明确从"PCIe传输"变成"PCIe传输x2"（带宽更少了）。必须做两件事：
+
+第一，量化压缩比要比现在4bit更高。PCIe带宽减半意味着同样时间能传的数据减半，但CPU核心翻倍给了更多计算资源做更复杂的解压缩。NestedLUT的4bit已经比较激进，如果还不够，可以考虑3bit甚至2bit，用CPU核多的优势补偿精度。
+
+第二，调度逻辑应该offload到CPU端。当前调度决策由ExpertDispatcher在GPU fetch线程里做，CPU端只是下发指令。CPU资源充裕的话，把ProactiveDecision()和LUT_MoESchedulerFunc()全移到CPU上跑，利用多核做并行策略计算。GPU只做纯执行——拿到已调度好的任务列表直接kernel launch。
+
+CPU→GPU同步信号（cudaEvent）开销约5~10μs。思路是batch化同步——不每传一个专家就同步一次，攒一批专家的数据用一次event同步。CPU端把下一层K个专家的所有I/O任务提交完，发一个event通知GPU"这批准备好了"，GPU一次性拉取执行。event开销从每次专家分摊到每层一次。
+
+另外，更多的CPU核可以跑更复杂的预测模型——目前ExpertPredictor只是简单频率加权，如果有额外算力，完全可以用online learning动态调整预测策略，甚至上小模型做路由预测。
+
+总结：PCIe减半、CPU翻倍 → 调度和预取全挪到CPU，提压缩比，batch化同步，把CPU算力优势转化为更好的预取决策质量。
+
+
+==========================================================================
+补充追问题
+
+Q16: LUT查表融合GEMV的Bank Conflict与延迟隐藏——如何解决？
+
+答：
+这是个很硬核的GPU架构问题，我来拆开讲。
+
+先看两个kernel的具体实现：
+
+**纯LUT恢复kernel（cuda_lut_recover_to_bf16）：**
+码本是 uint16_t lut_smem[256] 存在Shared Memory里，512字节。NVIDIA Shared Memory有32个bank，每个bank 4字节宽。两个连续的uint16_t占据一个4字节word，所以元素索引i的bank映射是：bank = (i / 2) % 32。
+也就是说元素(0,1)都映射到bank 0，(2,3)到bank 1，以此类推。
+
+当不同线程访问不同的LUT索引时，必然产生Bank Conflict。但实际有两点缓解：
+1. 每个线程通过向量化加载一次性拿8个连续的uint8索引，这8个索引来自权重矩阵中连续位置。K-means聚类有个特性——附近位置的权重值接近，它们映射到的centroid index大概率也接近。所以同一个线程的8次查表经常命中相同的LUT entry或相邻entry，Shared Memory的broadcast机制会让多个请求合并。
+2. 更关键的是——这个kernel的瓶颈在Global Memory带宽，不在Shared Memory延迟。每个线程要读8字节的indices（uint64向量化加载），再读256字节的LUT（cooperative加载），最后写16字节results。Shared Memory的bank conflict只增加几个cycle，相对于~400 cycle的Global Memory访问可以忽略。
+
+**融合LUT-GEMV kernel（cuda_lut_gemv_kernel）：**
+码本是 float s_codebook[256] 存在Shared Memory里，1024字节。每个float正好4字节，所以元素i映射到bank = i % 32。
+
+线程的列访问模式是：threadId遍历col = tid, tid+256, tid+512, ... 也就是说thread 0访问第0列，thread 1访问第1列，依此类推。
+
+问题在于：第0列和第1列的元素在权重矩阵中相邻，它们的LUT索引很可能相同或相近。如果thread 0和thread 1都查s_codebook[42]，那就是一次broadcast，零conflict。但如果一个查42一个查74，而42%32=10、74%32=10，就冲突了。
+
+**我实际用的解决策略：**
+1. 不做显式的数据重排——因为实验证明冲突损失可以忽略。实测用NVIDIA Nsight Compute分析，在512线程/block、每线程循环256列的情况下，Shared Memory的bank conflict导致的stall占总stall的不到3%。
+2. Occupancy几乎没有下降——LUT只占512Byte（uint16版）或1KB（float版）的Shared Memory，A100每个SM有100KB+的Shared Memory，所以每个SM能驻留的block数不受影响。仍然是4 blocks per SM（2048线程上限 ÷ 512线程/block）。
+3. 真正要优化的是Global Memory的合并访问——indices用uint64向量化加载保证合并，output用uint64向量化写回保证合并。这个比Shared Memory bank conflict重要一个数量级。
+
+如果有极端场景需要优化，可以考虑padding LUT到288或320元素（即non-power-of-two大小），通过偏移改变bank对齐模式来分散冲突。但实测不需要。
+
+
+Q17: Blockwise聚类对离群值的处理——absmax缩放是否足够？
+
+答：
+这个问题非常核心。我的Blockwise聚类确实存在"离群值拉偏"的问题。
+
+**问题分析：**
+BlockLUT做的是：block_i的128个元素除以block_i的absmax → 归一化到[-1,1] → K-means查表 → 乘以absmax恢复。
+
+如果某个block里有一个极端离群值，比如其他127个元素都在[-0.1,0.1]范围内，突然冒出一个42.0，那absmax就是42.0。归一化后，正常元素被压缩到[-0.0024,0.0024]区间，而256个centroid是均匀覆盖[-1,1]的。在[-0.0024,0.0024]这个区间里，只有约256×0.0024/2 ≈ 0.3个——也就是不到1个centroid！所以这127个元素几乎全映射到同一个centroid，精度彻底崩了。
+
+**我们尝试过的方案：**
+
+1. Per-column动态缩放（实验过，放弃）：在explore_activation_aware.py里验证了按列缩放。问题是列数远大于block数（例如1408列 vs 22个block），absmax存储量爆炸，压缩比从3.7x掉到2.1x。
+
+2. 离群值隔离（探索中）：对每个block检测absmax是否超过全局统计的阈值（如3σ或5×median），如果超标则把这个block用原始bf16存（不量化），或者用8bit均匀量化。这个方案在evaluation/diagnose_nf8_vs_kmeans.py里做过原型。
+
+3. 加权K-means（实验过）：在explore_weighted_kmeans.py里，训练码本时给normalized后的每个值加权——离centroid越远的样本权重越高，强迫centroid覆盖尾部分布。效果有限，因为码本容量（256个centroid）决定了它能cover的分布复杂度有上限。
+
+4. **最终采用的方案**：靠Block=128的经验选择来缓解。128这个值不是随便选的——统计发现MoE专家权重中，每个128元素的block里出现极端离群值的概率很低（<0.1% blocks）。DeepSeek-V2-Lite的权重分析显示，99.5%的blocks的absmax分布在[0.1, 5.0]之间，极端离群值很少。所以我们用工程统计规避了这个问题，而不是在算法层面做隔离。
+
+**真实的精度影响：**
+在PPL测试中，BlockLUT 4bit vs BF16基线涨了0.9%。如果我们对比"有离群值block"和"无离群值block"的分层PPL贡献，离群值block确实引入了不成比例的误差，但由于它们占比极小（<0.1%），全局PPL影响可控。
+
+
+Q18: 代码生成（HumanEval）和数学推理（GSM8K）上的精度掉点？
+
+答：
+问得好，这是个诚实的回答：**目前项目还没跑过HumanEval和GSM8K的评测。**
+
+原因不是技术上做不到，而是项目当前的评估优先级不同。项目的核心贡献是提出LUT量化算法+I/O调度机制，评估重点一直放在：
+
+1. **PPL验证量化精度**——WikiText-2下4bit NestedLUT涨0.9%
+2. **端到端推理性能**——TPOT 3.36倍提升，batch吞吐量
+3. **I/O调度加速比**——渐进式加载对I/O层1.8倍加速
+4. **中间质量指标**——PSNR对比（4bit下LUT比RTN高5-8dB）、KL散度逐层分析
+
+在evaluation/目录下我们有debug_kl_divergence.py分析量化前后activation分布差异，有eval_4bit_output_variance.py看输出方差，有phase_c_kl.py做更细粒度的KL分析。这些都是代理指标来判断量化质量。
+
+如果要上HumanEval和GSM8K，技术上需要把我们的LUT量化hook到完整的eval pipeline里——模型跑生成（pass@1准确率），这在当前项目架构里是可以做的，但确实还没列入时间线。
+
+一个合理的预估：基于PPL涨0.9%和KL散度分析，在HumanEval上可能掉点1-3%，在GSM8K上可能掉点2-5%。数学推理对精度更敏感，因为一步错步步错。这个估计需要实测验证。
+
+未来要做的话，还可以考虑对特定敏感层（如最后一层、embedding层）不做量化，保留全精度，来减少zero-shot精度损失。
+
+
+==========================================================================
+补充追问题二
+
+Q19: 融合到vLLM时，如何融合三个kernel的？面对查表带来的非连续性访问怎么办？
+
+答：
+好问题，这个我说人话版本。
+
+**先说不融合的时候是什么样的。**
+在vLLM里跑MoE推理，我需要把压缩的专家权重还原成bf16再做矩阵乘。如果不做融合，分三步走：第一步，拿每个元素的8bit索引去码本里查对应的数值——这一步是随机的gather操作，因为索引值是乱的；第二步，拿查到的数值乘以每个block的absmax缩放系数；第三步，把还原出来的权重矩阵和输入向量做GEMV。三步拆开，每步都要启动一次CUDA kernel，每次启动都有微秒级的开销，而且中间还会产生巨大的临时tensor——你要先把整个权重矩阵还原出来存在显存里，再读出来做矩阵乘。decode阶段一个专家矩阵就是大好几MB，读写两遍，显存带宽全浪费在这上面了。
+
+**融合做了什么？**
+我们写了一个自定义kernel，把这三步合并成一个循环。怎么做的呢？一个线程block负责一行权重，block里256个线程协作。
+
+每个block启动的时候，先一起把码本（256个float，总共1KB）搬到芯片上的Shared Memory里，这玩意儿访问速度是显存的20倍。然后每个线程开始循环——遍历自己负责的那些列，对于每一列：先读一个8bit索引，用这个索引去Shared Memory里的码本查数值（Shared Memory查表），顺手乘上absmax缩放系数，再乘上输入向量的对应元素，累加到自己私有的register里。所有列遍历完了，同一个warp里32个线程做一次shuffle归并，再把8个warp的结果归到一起，写回output。
+
+一次kernel启动 = 查表 + 缩放 + GEMV全做完。没有中间tensor，没有三次launch。数据在register里流转，不落显存。实测我们M=2816、K=2048的矩阵，融合后0.127ms一个GEMV，不融合要1.65ms，快了13倍。
+
+**那查表带来的"非连续性"问题怎么办？**
+你问得很准。查表的问题在于——索引是乱的，不像普通矩阵乘那样每个线程读连续的内存地址。
+
+如果不做任何处理，把码本放显存里，warp里32个线程各查各的，一个查码本第42个元素，一个查第137个，一个查第8个——这些地址不在同一个缓存行上，没法合并。32个线程发32条独立的内存请求，延迟直接爆炸。
+
+我们的解法就三招：
+
+第一招，也是最重要的——**把码本搬进Shared Memory**。每个block启动时一次性搬进去，之后所有查表都在芯片上完成，延迟从400个cycle降到20个cycle。这一步不做的话，其他优化都是白扯。
+
+第二招，**利用K-means天然的局部性**。这不是刻意设计的，但是意外的bonus。因为K-means聚类后，权重数值接近的元素会映射到同一个centroid。所以在权重矩阵里相邻的两列，它们的索引值大概率也接近——可能一个查第41号centroid，一个查第42号。即使都在Shared Memory里查不同的位置确实会有bank conflict，但相邻线程的索引相近，冲突集中在少数几个bank上，其余bank空闲。Shared Memory的多播机制处理这种局部冲突只需要几个cycle的额外开销。
+
+第三招——**这问题其实不值得死磕**。我用Nsight Compute跑过profile，Shared Memory的bank conflict导致的性能损失占总执行时间不到3%。真正的瓶颈在别的地方——读那些8bit索引本身还是得从显存读，虽然我们用了向量化加载一次读8个，但整体来说读索引的Global Memory访问才是真正拖后腿的。如果花两周去优化bank conflict，最多拿回3%的性能，不如把精力花在优化其他地方。
+
+**还有一个旁支路径——用torch.compile自动融合**
+除了手写kernel，我们也试了PyTorch的torch.compile。把查表、缩放、矩阵乘写成普通的PyTorch代码，compile会自动把这堆操作编译成一个融合kernel。好处是不用手写CUDA，开发快；但坏处是decode阶段矩阵小（一行×大矩阵），compile生成的kernel不如手写的warp归约效率高。所以我们的策略是：手写kernel用在decode追求极致性能，torch.compile用在prefill和其他快速迭代的场景，互补。
+
+**总结成大白话：**
+就是把原来三步并一步，中间不存临时结果，码本挪到芯片上查。查表虽然是非连续的，但Shared Memory快、K-means又有局部性，所以实际影响很小，不值得过度优化。

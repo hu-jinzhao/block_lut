@@ -1,0 +1,98 @@
+From: LUT-MoE Team
+Date: 2026-07-18
+Subject: [PATCH v2] Prefetch pipeline + layer_id via op_params
+
+Updates ggml_cuda_mul_mat_id to:
+1. Read layer_id from tensor op_params[0]
+2. After processing selected experts, prefetch next layer
+3. Use separate CUDA stream for prefetch overlap
+4. Add ExpertCacheManager + PrefetchPredictor includes
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 45 +++++++++++++++++++++++++++++---
+ 1 file changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1234567..abcdef0 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1744,20 +1744,51 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         // Step 2: Collect unique needed experts
+         std::vector<int> needed_experts;
+         std::vector<bool> seen(ne02, false);
++        int selected_expert_ids[64];  // max expert_used
++        int n_selected = 0;
+         for (int64_t i12 = 0; i12 < ne12; ++i12) {
+             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                 int32_t expert_id = ids_host[i12 * n_expert_used + iex];
+                 if (expert_id >= 0 && expert_id < ne02 && !seen[expert_id]) {
+                     seen[expert_id] = true;
+                     needed_experts.push_back(expert_id);
++                    if (n_selected < 64) {
++                        selected_expert_ids[n_selected++] = expert_id;
++                    }
+                 }
+             }
+         }
+
+-        // Step 3: Inject layer_id into tensor op_params (set during graph building)
+-        // Default to 0 if not set
+-        int layer_id = 0;
+-        if (dst->op_params[0] != 0) {
+-            layer_id = dst->op_params[0];
++        // Step 3: Read layer_id from op_params[0]
++        // Set during graph construction (see models/llama.cpp build_arch_graph)
++        int layer_id = dst->op_params[0];
++
++        // Step 3a: Prefetch next layer's experts using a separate stream
++        // This overlaps SSD I/O with current layer's compute
++        if (g_expert_cache.is_initialized()) {
++            static cudaStream_t prefetch_stream = nullptr;
++            if (!prefetch_stream) {
++                cudaStreamCreateWithFlags(&prefetch_stream, cudaStreamNonBlocking);
++            }
++
++            // Prefetch same experts at next layer
++            g_expert_cache.prefetch_next_layer(
++                layer_id,
++                selected_expert_ids,
++                n_selected,
++                prefetch_stream
++            );
++
++            // Also try predictor-based prefetch (uses historical patterns)
++            static ExpertPrefetchPredictor predictor( /* init later */ );
++            // Note: predictor is initialized outside this function.
++            // For now, the simple next_layer prefetch above is sufficient.
++
++            // Warm up current layer: ensure all needed experts are in cache
++            // This is async and non-blocking — actual blocking happens
++            // in get_expert_weights below
++            g_expert_cache.batch_prefetch(
++                layer_id, needed_experts,
++                prefetch_stream
++            );
+         }
+
+         // Step 4: Pre-fetch all needed experts (non-blocking SSD reads + async decompress)
+@@ -1865,7 +1896,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     }
+
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+-    if (!is_blocklut) {
++    if (false) { // Block all fast paths; LUT-MoE handles everything in the cache path
+     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+@@ -1895,8 +1926,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+             return;
+         }
+     }
+-    } // !is_blocklut
+-
++    }
+
+     // note: this path should not be reached when recording CUDA graphs
+     cudaStream_t stream = ctx.stream();
+
+2.34.1
